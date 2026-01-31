@@ -1,5 +1,7 @@
 """不确定性评估模块"""
 
+from __future__ import annotations
+
 import pandas as pd
 import numpy as np
 
@@ -60,51 +62,115 @@ def weekly_uncertainty(long_df: pd.DataFrame, vote_share_col: str = "vote_share"
     return grouped
 
 
-def analyze_vote_share_intervals(long_df: pd.DataFrame, vote_share_col: str = "audience_share", confidence: float = 0.95) -> dict:
-    """分析每个选手每周的投票比例区间和方差
+def analyze_vote_share_intervals(
+    long_df: pd.DataFrame,
+    feature_cols: list[str],
+    model_class,
+    train_mask: pd.Series | None = None,
+    vote_share_col: str = "audience_share",
+    confidence: float = 0.95,
+    n_bootstrap: int = 200,
+    random_state: int = 42
+) -> dict:
+    """使用模型Bootstrap分析每个选手每周的投票比例不确定性
     
-    返回：
-    - 选手级别：平均区间宽度、后验方差
-    - 周级别：该周的不确定性分析
+    方法：
+    1. 对训练样本有放回重采样
+    2. 重新训练观众投票预测模型
+    3. 对全体样本预测投票比例
+    4. 统计每个选手-周的Bootstrap分布区间与方差
+    
+    Parameters
+    ----------
+    long_df : pd.DataFrame
+        包含特征与标签的长表
+    feature_cols : list[str]
+        模型特征列
+    model_class : type
+        可实例化的模型类（例如 VoteShareModel）
+    train_mask : pd.Series | None
+        训练样本掩码（与 long_df 对齐），若为 None 则使用全量样本
+    vote_share_col : str
+        原始投票比例列名，用于输出对比
+    confidence : float
+        置信度，默认0.95
+    n_bootstrap : int
+        Bootstrap重采样次数，默认200
+    random_state : int
+        随机种子
+    
+    Returns
+    -------
+    dict
+        包含每个选手-周的区间和不确定性指标
     """
-    from scipy import stats
-    
-    # 选手级别分析
-    celeb_analysis = long_df.groupby(["season", "celebrity_name"])[vote_share_col].agg([
-        'mean',
-        'std',
-        'count',
-        'min',
-        'max'
-    ]).reset_index()
-    
-    # 计算95%置信区间宽度
-    z_score = stats.norm.ppf((1 + confidence) / 2)
-    celeb_analysis['interval_width'] = (z_score * celeb_analysis['std'] / np.sqrt(celeb_analysis['count'])).fillna(0)
-    celeb_analysis['variance'] = celeb_analysis['std'] ** 2
-    
-    # 周级别分析
-    week_analysis = long_df.groupby(["season", "week"])[vote_share_col].agg([
-        'mean',
-        'std',
-        'count',
-        'min',
-        'max'
-    ]).reset_index()
-    
-    week_analysis['interval_width'] = (z_score * week_analysis['std'] / np.sqrt(week_analysis['count'])).fillna(0)
-    week_analysis['variance'] = week_analysis['std'] ** 2
-    
-    # 识别高不确定性周（方差大的周）
-    high_uncertainty_weeks = week_analysis[week_analysis['variance'] > week_analysis['variance'].quantile(0.75)]
-    
+    if train_mask is None:
+        train_mask = pd.Series(True, index=long_df.index)
+
+    train_df = long_df.loc[train_mask]
+    if train_df.empty:
+        return {
+            'celeb_week_level': pd.DataFrame(),
+            'mean_interval_width': np.nan,
+            'mean_variance': np.nan,
+            'summary': {}
+        }
+
+    n_rows = len(long_df)
+    rng = np.random.default_rng(random_state)
+
+    bootstrap_preds = np.zeros((n_bootstrap, n_rows), dtype=float)
+
+    for b in range(n_bootstrap):
+        sample_idx = rng.choice(train_df.index.to_numpy(), size=len(train_df), replace=True)
+        boot_df = long_df.loc[sample_idx]
+
+        model = model_class()
+        model.fit(boot_df[feature_cols], boot_df["is_eliminated"])
+
+        elimination_prob = model.predict(long_df[feature_cols])
+        survival_prob = pd.Series(1 - elimination_prob, index=long_df.index)
+        audience_share = survival_prob.groupby([long_df["season"], long_df["week"]]).transform(
+            lambda s: s / (s.sum() + 1e-10)
+        )
+        bootstrap_preds[b, :] = audience_share.to_numpy()
+
+    alpha = 1 - confidence
+    lower_percentile = (alpha / 2) * 100
+    upper_percentile = (1 - alpha / 2) * 100
+
+    ci_lower = np.percentile(bootstrap_preds, lower_percentile, axis=0)
+    ci_upper = np.percentile(bootstrap_preds, upper_percentile, axis=0)
+    interval_width = ci_upper - ci_lower
+
+    mean_bootstrap = bootstrap_preds.mean(axis=0)
+    std_bootstrap = bootstrap_preds.std(axis=0)
+
+    celeb_week_df = long_df[["season", "week", "celebrity_name", vote_share_col]].copy()
+    celeb_week_df = celeb_week_df.rename(columns={vote_share_col: "vote_share"})
+    celeb_week_df["bootstrap_mean"] = mean_bootstrap
+    celeb_week_df["bootstrap_std"] = std_bootstrap
+    celeb_week_df["bootstrap_variance"] = std_bootstrap ** 2
+    celeb_week_df["interval_lower"] = ci_lower
+    celeb_week_df["interval_upper"] = ci_upper
+    celeb_week_df["interval_width"] = interval_width
+    celeb_week_df["n_bootstrap"] = n_bootstrap
+    celeb_week_df["confidence_level"] = confidence
+
+    summary = {
+        'mean_interval_width': float(np.mean(interval_width)),
+        'std_interval_width': float(np.std(interval_width)),
+        'mean_variance': float(np.mean(std_bootstrap ** 2)),
+        'mean_std': float(np.mean(std_bootstrap)),
+        'total_observations': int(n_rows),
+        'total_weeks': int(long_df.groupby(["season", "week"]).ngroups)
+    }
+
     return {
-        'celeb_level': celeb_analysis,
-        'week_level': week_analysis,
-        'high_uncertainty_weeks': high_uncertainty_weeks,
-        'mean_interval_width': float(celeb_analysis['interval_width'].mean()),
-        'mean_variance': float(celeb_analysis['variance'].mean()),
-        'high_uncertainty_reason': _analyze_uncertainty_reasons(long_df, high_uncertainty_weeks)
+        'celeb_week_level': celeb_week_df,
+        'mean_interval_width': float(np.mean(interval_width)),
+        'mean_variance': float(np.mean(std_bootstrap ** 2)),
+        'summary': summary
     }
 
 
