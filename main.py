@@ -34,7 +34,7 @@ from features.judge_features import build_judge_features
 from features.environment_features import build_environment_features
 from features.personal_features import build_personal_features
 
-from models.vote_share_model import VoteShareModel
+from models.vote_share_model import EliminationProbModel
 from models.vote_rank_model import VoteRankModel
 from models.season28_plus import Season28PlusRules
 from evaluation.consistency import (
@@ -44,7 +44,8 @@ from evaluation.consistency import (
 )
 from evaluation.uncertainty import (
     weekly_uncertainty,
-    analyze_vote_share_intervals
+    analyze_vote_share_intervals,
+    analyze_vote_count_uncertainty
 )
 from evaluation.fairness import reversal_ratios
 
@@ -232,10 +233,10 @@ def main():
 
    
     
-    # 仅用第 3-27 季训练投票比例模型（可预测观众投票比例）
-    print("- 淘汰概率模型 (预测该周是否被淘汰, 训练集: 第3-27季)")
+    # 训练淘汰概率模型（预测该周是否被淘汰）
+    print("- 淘汰概率模型 (预测该周是否被淘汰, 训练集: 第1-34季)")
     share_train_mask = (long_df["season"] >= 1) & (long_df["season"] <= 34) 
-    elimination_model = VoteShareModel()
+    elimination_model = EliminationProbModel()
     elimination_model.fit(long_df.loc[share_train_mask, feature_cols], long_df.loc[share_train_mask, "is_eliminated"])
     long_df["elimination_prob"] = elimination_model.predict(long_df[feature_cols])
     long_df["elimination_prob"] = long_df["elimination_prob"].clip(0, 1)  # 限制在 0-1
@@ -337,14 +338,30 @@ def main():
     print(f"投票比例范围: [{long_df['audience_share'].min():.4f}, {long_df['audience_share'].max():.4f}]")
     
     print("\n- 淘汰预测准确性")
+    # 综合准确率（所有选手-周记录的准确率）
     elimination_accuracy = (long_df["pred_eliminated"] == long_df["is_eliminated"]).mean()
-    print(f"淘汰预测准确率: {elimination_accuracy:.4f}")
+    print(f"记录级别准确率: {elimination_accuracy:.4f} (所有选手-周记录)")
     
-    # 统计按周的预测准确性
-    week_accuracy = long_df.groupby(["season", "week"]).apply(
+    # 只针对被淘汰选手的准确率（召回率 Recall）
+    eliminated_only = long_df[long_df["is_eliminated"] == 1]
+    if len(eliminated_only) > 0:
+        recall = (eliminated_only["pred_eliminated"] == 1).mean()
+        print(f"淘汰者识别准确率 (Recall): {recall:.4f} (仅统计真正被淘汰的{len(eliminated_only)}人)")
+    else:
+        recall = None
+        print(f"淘汰者识别准确率 (Recall): N/A (无淘汰记录)")
+    
+    # 每周平均准确率（每周单独计算准确率再平均）
+    week_level_accuracy = long_df.groupby(["season", "week"]).apply(
+        lambda g: (g["pred_eliminated"] == g["is_eliminated"]).mean()
+    ).mean()
+    print(f"周平均准确率: {week_level_accuracy:.4f} (每周准确率的平均)")
+    
+    # 周级别完全正确率（整周所有人都预测对才算对）
+    week_perfect_accuracy = long_df.groupby(["season", "week"]).apply(
         lambda g: (g["pred_eliminated"] == g["is_eliminated"]).all()
     ).mean()
-    print(f"周级别完全正确率: {week_accuracy:.4f} (整周所有人的淘汰/留任都预测对)")
+    print(f"周级别完全正确率: {week_perfect_accuracy:.4f} (整周所有人都对)")
     
     # 按淘汰人数类型分析（仅统计有效周）
     valid_mask = long_df["judge_total_score"] > 0
@@ -403,18 +420,58 @@ def main():
     # ========== 不确定性分析 ==========
     print("\n=== 不确定性分析：投票区间和方差 ===")
     
+    print("- Bootstrap 分析（500次重采样）...")
     uncertainty = analyze_vote_share_intervals(
         long_df,
         feature_cols=feature_cols,
-        model_class=VoteShareModel,
+        model_class=EliminationProbModel,
         train_mask=share_train_mask,
         vote_share_col="audience_share",
         confidence=0.95,
         n_bootstrap=500
     )
-    print(f"选手级别分析:")
-    print(f"  - 平均区间宽度 (95% CI): {uncertainty['mean_interval_width']:.4f}")
-    print(f"  - 平均后验方差: {uncertainty['mean_variance']:.4f}")
+    print(f"  选手级别分析:")
+    print(f"    - 平均区间宽度 (95% CI): {uncertainty['mean_interval_width']:.4f}")
+    print(f"    - 平均后验方差: {uncertainty['mean_variance']:.4f}")
+    
+    # 投票总数和个人票数的确定性分析
+    print("\n- 投票总数确定性分析...")
+    vote_count_uncertainty = analyze_vote_count_uncertainty(
+        bootstrap_samples=uncertainty['bootstrap_samples'],
+        long_df=long_df,
+        base_total_votes=5e6,  # 基准 500万 票/周
+        votes_variation_by_week=True,  # 允许每周不同
+        random_state=42
+    )
+    
+    overall_stats = vote_count_uncertainty['overall_stats']
+    print(f"  投票总数设置:")
+    print(f"    - 基准值: {overall_stats['base_total_votes']:.0f} 票/周")
+    print(f"    - 平均值: {overall_stats['mean_weekly_votes']:.0f} 票/周")
+    print(f"    - 标准差: {overall_stats['std_weekly_votes']:.0f} 票")
+    print(f"  个人票数不确定性:")
+    print(f"    - 平均变异系数(CV): {overall_stats['mean_individual_cv']:.4f}")
+    print(f"    - 平均票数区间宽度(95% CI): {overall_stats['mean_individual_ci_width']:.0f} 票")
+    print(f"    - 平均标准差: {overall_stats['mean_individual_std']:.0f} 票")
+    print(f"    - 平均相对区间宽度: {overall_stats['mean_relative_ci_width']:.4f}")
+    
+    # 导出详细的选手级别不确定性数据
+    individual_uncertainty = vote_count_uncertainty['individual_summary']
+    output_path = project_root / 'data' / 'individual_vote_uncertainty.csv'
+    try:
+        individual_uncertainty.to_csv(output_path, index=False, encoding='utf-8-sig')
+        print(f"\n  [已导出] 选手级别不确定性数据: {output_path}")
+        print(f"    - 共 {len(individual_uncertainty)} 条记录")
+        print(f"    - 列名: {list(individual_uncertainty.columns)}")
+        print(f"\n  前5条示例:")
+        for _, row in individual_uncertainty.head(5).iterrows():
+            print(f"    S{int(row['season'])}W{int(row['week'])} {row['celebrity_name']}: "
+                  f"票数={row['vote_mean']:.0f}, CI宽度={row['vote_ci_width']:.0f}, "
+                  f"CV={row['coefficient_of_variation']:.4f}")
+    except PermissionError:
+        print(f"\n  [警告] 无法写入: {output_path}（文件被占用）")
+    except Exception as e:
+        print(f"\n  [错误] 导出失败: {e}")
     
     
     # ========== 公平性评估 ==========

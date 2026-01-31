@@ -1,11 +1,11 @@
-"""投票份额模型（第 3-27 季）"""
+"""淘汰概率预测模型"""
 
 import pandas as pd
 import numpy as np
 
 
-class VoteShareModel:
-    """投票份额预测模型"""
+class EliminationProbModel:
+    """淘汰概率预测模型（基于岭回归）"""
     
     def __init__(self):
         self.coef_ = None
@@ -19,7 +19,7 @@ class VoteShareModel:
         
         Args:
             X: 特征矩阵
-            y: 投票份额目标值
+            y: 淘汰标签（0=留任, 1=淘汰）
         """
         X = np.asarray(X, dtype=float)
         y = np.asarray(y, dtype=float)
@@ -36,7 +36,7 @@ class VoteShareModel:
         return self
     
     def predict(self, X):
-        """预测投票份额"""
+        """预测淘汰概率（0-1之间的连续值）"""
         if self.coef_ is None:
             raise ValueError("模型未训练")
         X = np.asarray(X, dtype=float)

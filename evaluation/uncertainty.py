@@ -168,6 +168,7 @@ def analyze_vote_share_intervals(
 
     return {
         'celeb_week_level': celeb_week_df,
+        'bootstrap_samples': bootstrap_preds,  # (n_bootstrap, n_rows)
         'mean_interval_width': float(np.mean(interval_width)),
         'mean_variance': float(np.mean(std_bootstrap ** 2)),
         'summary': summary
@@ -211,4 +212,132 @@ def _determine_reason(n_contestants: int, score_std: float, n_ties: int) -> str:
         return "并列现象较多"
     else:
         return "综合因素"
+
+
+def analyze_vote_count_uncertainty(
+    bootstrap_samples: np.ndarray,
+    long_df: pd.DataFrame,
+    base_total_votes: float = 5e6,
+    votes_variation_by_week: bool = True,
+    random_state: int = 42
+) -> dict:
+    """分析投票总数和个人票数的不确定性
+    
+    子问题3：观众投票总数确定性分析
+    
+    核心设计：
+    1. 直接使用 Bootstrap 原始样本（保证周内比例和=1）
+    2. 每周有不同的总票数（基于选手数、赛季进度）
+    3. 可复现（固定随机种子）
+    
+    Parameters
+    ----------
+    bootstrap_samples : np.ndarray
+        Bootstrap 原始样本矩阵 (n_bootstrap, n_rows)，来自 analyze_vote_share_intervals
+    long_df : pd.DataFrame
+        原始长表，包含 season, week, celebrity_name, audience_share 列
+    base_total_votes : float
+        基准投票总数，默认 500万
+    votes_variation_by_week : bool
+        是否允许每周投票总数不同，默认 True
+    random_state : int
+        随机种子，默认 42
+        
+    Returns
+    -------
+    dict
+        包含：
+        - 'weekly_summary': 每周投票总数的统计
+        - 'individual_summary': 每位选手票数的不确定性指标
+        - 'overall_stats': 全局统计
+    """
+    rng = np.random.default_rng(random_state)
+    n_bootstrap = bootstrap_samples.shape[0]
+    
+    # 为每周计算不同的总票数（基于选手数和赛季进度）
+    week_info = long_df.groupby(['season', 'week']).agg(
+        n_contestants=('celebrity_name', 'count'),
+        week_num=('week', 'first'),
+        season_num=('season', 'first')
+    ).reset_index()
+    
+    weeks_data = []
+    individual_data = []
+    
+    for idx, week_row in week_info.iterrows():
+        season = week_row['season']
+        week = week_row['week']
+        n_contestants = week_row['n_contestants']
+        
+        # 每周的总票数根据选手数和赛季进度调整
+        if votes_variation_by_week:
+            # 选手越少（赛季后期），投票数略减少
+            # 赛季越新，投票数略增加（节目热度提升）
+            contestant_factor = 0.8 + 0.2 * (n_contestants / 12)  # 假设最多12人
+            season_factor = 0.9 + 0.1 * (season / 34)  # 第34季热度最高
+            week_total_votes = base_total_votes * contestant_factor * season_factor
+        else:
+            week_total_votes = base_total_votes
+        
+        weeks_data.append({
+            'season': season,
+            'week': week,
+            'total_votes': week_total_votes,
+            'n_contestants': n_contestants
+        })
+        
+        # 获取该周所有选手的索引
+        week_mask = (long_df['season'] == season) & (long_df['week'] == week)
+        week_indices = long_df.index[week_mask].tolist()
+        week_group = long_df.loc[week_mask]
+        
+        # 从 Bootstrap 样本中提取该周所有选手的比例（保证和=1）
+        # bootstrap_samples[:, week_indices] 形状: (n_bootstrap, n_contestants_in_week)
+        week_shares_bootstrap = bootstrap_samples[:, week_indices]  # (n_bootstrap, n_contestants)
+        
+        # 票数 = 比例 × 总票数
+        # week_votes_bootstrap: (n_bootstrap, n_contestants)
+        week_votes_bootstrap = week_shares_bootstrap * week_total_votes
+        
+        # 为每位选手计算统计指标
+        for i, (_, row) in enumerate(week_group.iterrows()):
+            celebrity = row['celebrity_name']
+            
+            # 该选手的票数样本
+            vote_samples = week_votes_bootstrap[:, i]
+            
+            vote_mean = np.mean(vote_samples)
+            vote_std = np.std(vote_samples)
+            vote_ci_lower = np.percentile(vote_samples, 2.5)
+            vote_ci_upper = np.percentile(vote_samples, 97.5)
+            
+            individual_data.append({
+                'season': season,
+                'week': week,
+                'celebrity_name': celebrity,
+                'vote_mean': vote_mean,
+                'vote_std': vote_std,
+                'vote_ci_lower': vote_ci_lower,
+                'vote_ci_upper': vote_ci_upper,
+                'vote_ci_width': vote_ci_upper - vote_ci_lower,
+                'coefficient_of_variation': vote_std / vote_mean if vote_mean > 0 else np.nan,
+                'relative_ci_width': (vote_ci_upper - vote_ci_lower) / vote_mean if vote_mean > 0 else np.nan
+            })
+    
+    weeks_df = pd.DataFrame(weeks_data)
+    individual_df = pd.DataFrame(individual_data)
+    
+    return {
+        'weekly_summary': weeks_df,
+        'individual_summary': individual_df,
+        'overall_stats': {
+            'base_total_votes': base_total_votes,
+            'mean_weekly_votes': float(weeks_df['total_votes'].mean()),
+            'std_weekly_votes': float(weeks_df['total_votes'].std()),
+            'mean_individual_cv': float(individual_df['coefficient_of_variation'].mean()),
+            'mean_individual_ci_width': float(individual_df['vote_ci_width'].mean()),
+            'mean_individual_std': float(individual_df['vote_std'].mean()),
+            'mean_relative_ci_width': float(individual_df['relative_ci_width'].mean())
+        }
+    }
 
