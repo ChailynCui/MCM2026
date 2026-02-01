@@ -400,6 +400,138 @@ def main():
         print(f"[错误] 导出排名表失败: {e}")
 
     print("[完成] 观众投票比例和排名已预测")
+    
+    # ========== 评委与观众排名差异分析 ==========
+    print("\n=== 评委与观众排名差异分析 ===")
+
+    # 百分比结合法（观众排名 = audience_share_rank）
+    long_df["rank_diff_share"] = abs(long_df["judge_rank"] - long_df["audience_share_rank"])
+    long_df["rank_direction_share"] = long_df["judge_rank"] - long_df["audience_share_rank"]
+
+    high_diff_share = long_df[long_df["rank_diff_share"] >= 2].copy()
+    if len(high_diff_share) > 0:
+        print(f"\n[百分比结合法] 排名差异>=2案例数: {len(high_diff_share)}")
+        case1_share = high_diff_share[high_diff_share["rank_direction_share"] > 0]
+        case2_share = high_diff_share[high_diff_share["rank_direction_share"] < 0]
+
+        print(f"  第1类(评委低/观众高): {len(case1_share)}人次")
+        print(f"  第2类(评委高/观众低): {len(case2_share)}人次")
+
+        share_comp = high_diff_share[[
+            "season", "week", "celebrity_name",
+            "judge_rank", "audience_share_rank", "judge_share", "audience_share",
+            "rank_diff_share", "rank_direction_share", "survival_prob"
+        ]].sort_values(["rank_direction_share", "rank_diff_share"], ascending=[False, False]).reset_index(drop=True)
+
+        share_comp_path = project_root / "data" / "ranking_discrepancy_analysis_percentage.csv"
+        try:
+            share_comp.to_csv(share_comp_path, index=False, encoding="utf-8-sig")
+            print(f"  [已导出] 百分比结合法差异表: {share_comp_path}")
+        except Exception as e:
+            print(f"  [错误] 导出失败: {e}")
+    else:
+        print("[百分比结合法] 无排名差异>=2的案例")
+
+    # 排名结合法（观众排名 = audience_rank）
+    long_df["rank_diff_rank"] = abs(long_df["judge_rank"] - long_df["audience_rank"])
+    long_df["rank_direction_rank"] = long_df["judge_rank"] - long_df["audience_rank"]
+
+    high_diff_rank = long_df[long_df["rank_diff_rank"] >= 2].copy()
+    if len(high_diff_rank) > 0:
+        print(f"\n[排名结合法] 排名差异>=2案例数: {len(high_diff_rank)}")
+        case1_rank = high_diff_rank[high_diff_rank["rank_direction_rank"] > 0]
+        case2_rank = high_diff_rank[high_diff_rank["rank_direction_rank"] < 0]
+
+        print(f"  第1类(评委低/观众高): {len(case1_rank)}人次")
+        print(f"  第2类(评委高/观众低): {len(case2_rank)}人次")
+
+        rank_comp = high_diff_rank[[
+            "season", "week", "celebrity_name",
+            "judge_rank", "audience_rank", "rank_diff_rank", "rank_direction_rank", "survival_prob"
+        ]].sort_values(["rank_direction_rank", "rank_diff_rank"], ascending=[False, False]).reset_index(drop=True)
+
+        rank_comp_path = project_root / "data" / "ranking_discrepancy_analysis_rank.csv"
+        try:
+            rank_comp.to_csv(rank_comp_path, index=False, encoding="utf-8-sig")
+            print(f"  [已导出] 排名结合法差异表: {rank_comp_path}")
+        except Exception as e:
+            print(f"  [错误] 导出失败: {e}")
+    else:
+        print("[排名结合法] 无排名差异>=2的案例")
+
+    # ========== 新方法：末尾两位 + 评委最低 ==========
+    print("\n=== 新方法：末尾两位 + 评委最低 ===")
+
+    def mark_eliminated_by_bottom2_then_judge(group):
+        """先取观众排名与评委排名末尾两位候选，再按评委评分淘汰最低者"""
+        n_elim = int(group["n_eliminated"].iloc[0])
+        group = group.copy()
+        group["pred_eliminated_alt"] = 0
+        if n_elim == 0:
+            return group
+
+        # 末尾两位（排名值越大越差）
+        bottom_audience = group.nlargest(2, "audience_rank").index
+        bottom_judge = group.nlargest(2, "judge_rank").index
+        candidate_idx = list(set(bottom_audience).union(set(bottom_judge)))
+        candidates = group.loc[candidate_idx]
+
+        # 按评委评分最低者淘汰（若要淘汰多人，则取最低的 n_elim 人）
+        elim_idx = candidates.nsmallest(n_elim, "judge_total_score").index
+        group.loc[elim_idx, "pred_eliminated_alt"] = 1
+        return group
+
+    long_df = long_df.groupby(["season", "week"], group_keys=False).apply(mark_eliminated_by_bottom2_then_judge)
+
+    # 新方法整体准确率
+    alt_accuracy = (long_df["pred_eliminated_alt"] == long_df["is_eliminated"]).mean()
+    print(f"新方法记录级别准确率: {alt_accuracy:.4f}")
+
+    # 新方法淘汰者识别准确率（召回率）
+    alt_eliminated_only = long_df[long_df["is_eliminated"] == 1]
+    if len(alt_eliminated_only) > 0:
+        alt_recall = (alt_eliminated_only["pred_eliminated_alt"] == 1).mean()
+        print(f"新方法淘汰者识别准确率(Recall): {alt_recall:.4f} (仅统计真正被淘汰的{len(alt_eliminated_only)}人)")
+    else:
+        alt_recall = None
+        print("新方法淘汰者识别准确率(Recall): N/A (无淘汰记录)")
+
+    # 按差异大小分析（排名结合法差异）
+    diff_threshold = 2
+    long_df["rank_diff_rank"] = abs(long_df["judge_rank"] - long_df["audience_rank"])
+    small_diff = long_df[long_df["rank_diff_rank"] < diff_threshold]
+    large_diff = long_df[long_df["rank_diff_rank"] >= diff_threshold]
+    if len(small_diff) > 0:
+        acc_small = (small_diff["pred_eliminated_alt"] == small_diff["is_eliminated"]).mean()
+        print(f"小差异(<{diff_threshold})样本数 {len(small_diff)}，新方法准确率: {acc_small:.4f}")
+    if len(large_diff) > 0:
+        acc_large = (large_diff["pred_eliminated_alt"] == large_diff["is_eliminated"]).mean()
+        print(f"大差异(>={diff_threshold})样本数 {len(large_diff)}，新方法准确率: {acc_large:.4f}")
+
+    # 两类案例分析（排名结合法）
+    case1_rank = long_df[long_df["judge_rank"] > long_df["audience_rank"]]
+    case2_rank = long_df[long_df["judge_rank"] < long_df["audience_rank"]]
+    if len(case1_rank) > 0:
+        acc_case1 = (case1_rank["pred_eliminated_alt"] == case1_rank["is_eliminated"]).mean()
+        print(f"第1类(评委低/观众高)样本数 {len(case1_rank)}，新方法准确率: {acc_case1:.4f}")
+    if len(case2_rank) > 0:
+        acc_case2 = (case2_rank["pred_eliminated_alt"] == case2_rank["is_eliminated"]).mean()
+        print(f"第2类(评委高/观众低)样本数 {len(case2_rank)}，新方法准确率: {acc_case2:.4f}")
+
+    # 导出新方法对比表
+    alt_cols = [
+        "season", "week", "celebrity_name",
+        "judge_rank", "audience_rank", "judge_total_score",
+        "rank_diff_rank", "pred_eliminated_alt", "is_eliminated"
+    ]
+    alt_df = long_df[alt_cols].sort_values(["season", "week", "pred_eliminated_alt", "judge_rank"], ascending=[True, True, False, True]).reset_index(drop=True)
+    alt_path = project_root / "data" / "elimination_rule_bottom2_then_judge.csv"
+    try:
+        alt_df.to_csv(alt_path, index=False, encoding="utf-8-sig")
+        print(f"[已导出] 新方法结果表: {alt_path}")
+    except Exception as e:
+        print(f"[错误] 导出新方法结果表失败: {e}")
+    
     # 8. 模型评估
     print("\n[步骤 8] 模型评估...")
     
